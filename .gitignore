@@ -1,0 +1,8 @@
+/target
+/dist
+/releases
+/Releases
+/.vpk
+*.iconset
+*.icns
+.DS_Store

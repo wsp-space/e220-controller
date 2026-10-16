@@ -1,0 +1,162 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  VPK_VERSION: 1.2.161
+  PACK_ID: E220Controller
+  PACK_TITLE: E220 Controller
+  PACK_AUTHORS: WSP Wakayama Univ.
+  APP_ID: WSP-WAKAYAMA.E220Controller
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+              exit 1
+            fi
+            git fetch origin main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::Tag $GITHUB_REF_NAME does not point to a commit on main"
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            channel: win
+          - os: macos-latest
+            channel: osx
+          - os: ubuntu-22.04
+            channel: linux
+    runs-on: ${{ matrix.os }}
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libudev-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev libfontconfig1-dev \
+            libfreetype6-dev libvulkan-dev libzstd-dev
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install vpk
+        run: |
+          dotnet tool install vpk --version "$VPK_VERSION" --tool-path .vpk
+          echo "$GITHUB_WORKSPACE/.vpk" >> "$GITHUB_PATH"
+
+      - name: Stage application files
+        run: |
+          mkdir -p dist
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/e220-controller.exe dist/
+          else
+            cp target/release/e220-controller dist/
+          fi
+
+      - name: Build macOS icon
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p icon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z $size $size assets/icon-macos.png --out icon.iconset/icon_${size}x${size}.png
+            double=$((size * 2))
+            sips -z $double $double assets/icon-macos.png --out icon.iconset/icon_${size}x${size}@2x.png
+          done
+          iconutil -c icns icon.iconset -o icon.icns
+
+      - name: Download previous release for deltas
+        if: github.ref_type == 'tag'
+        run: |
+          vpk download github --repoUrl "https://github.com/$GITHUB_REPOSITORY" \
+            --token "${{ secrets.GITHUB_TOKEN }}" --channel "${{ matrix.channel }}" -o releases \
+            || echo "No previous release for ${{ matrix.channel }}"
+
+      - name: Pack installer
+        run: |
+          case "$RUNNER_OS" in
+            Windows) extra=(--mainExe e220-controller.exe --icon assets/icon.ico --aumid "$APP_ID") ;;
+            macOS)   extra=(--mainExe e220-controller --icon icon.icns) ;;
+            Linux)   extra=(--mainExe e220-controller --icon assets/icon-linux.png --categories Development) ;;
+          esac
+          vpk pack --packId "$PACK_ID" --packVersion "$VERSION" --packDir dist \
+            --packTitle "$PACK_TITLE" --packAuthors "$PACK_AUTHORS" \
+            --channel "${{ matrix.channel }}" -o releases "${extra[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: releases-${{ matrix.channel }}
+          path: releases
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install vpk
+        run: |
+          dotnet tool install vpk --version "$VPK_VERSION" --tool-path .vpk
+          echo "$GITHUB_WORKSPACE/.vpk" >> "$GITHUB_PATH"
+
+      - name: Publish GitHub release
+        run: |
+          for channel in win osx linux; do
+            vpk upload github --repoUrl "https://github.com/$GITHUB_REPOSITORY" \
+              --token "${{ secrets.GITHUB_TOKEN }}" -o "artifacts/releases-$channel" \
+              --channel "$channel" --tag "v$VERSION" --releaseName "$PACK_TITLE $VERSION" \
+              --merge --publish
+          done
