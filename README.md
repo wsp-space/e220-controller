@@ -44,8 +44,8 @@ and packaged with [Velopack](https://velopack.io).
 2. Tag the commit on `main` and push the tag:
 
    ```bash
-   git tag v0.4.0
-   git push origin v0.4.0
+   git tag v0.1.0
+   git push origin v0.1.0
    ```
 
 The workflow refuses tags that do not match `Cargo.toml` or that point outside `main`.
